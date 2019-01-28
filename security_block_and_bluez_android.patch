@@ -1,0 +1,136 @@
+[PATCH] Bluetooth: btusb: Fix race condition between BT events and
+ ACL
+
+Workaround for a race condition observed with Android phones which makes
+fail some connections (30% with a Oneplus 6).
+
+After link key reply it is expected that HCI_EV_ENCRYPT_CHANGE is received
+before any ACL connection request or it will be dropped by bluez L2CAP
+layer.
+
+The events are received from usb interrupt transfer and ACL packet from usb
+bulk transfer. I guess the bluetooth controller does not handle correctly
+write ordering between those two transfer types.
+
+The workaround will start queueing ACL packets when link key are exchanged until
+the next real event (other than HCI_EV_CMD_COMPLETE) is received, it should
+be HCI_EV_ENCRYPT_CHANGE.
+
+LIMITATIONS:
+
+An unencrypted connection request forwarded by the controller at
+"ACL queueing time" could pass. Bluetooth specification says that ACL
+transfer is paused until encryption is setup so I hope it is safe to queue
+ACL between HCI_EV_LINK_KEY_REQ and HCI_EV_CMD_COMPLETE.
+
+With concurrent connections from multiple bluetooth devices the workaround
+could not work as any event from any device would flush the queue.
+---
+ drivers/bluetooth/btusb.c | 50 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index bff67c5a5fe7..c55096fa8c4e 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -406,6 +406,9 @@ struct btusb_data {
+ 	struct sk_buff *acl_skb;
+ 	struct sk_buff *sco_skb;
+
++	struct sk_buff_head acl_deferred_q;
++	int acl_deferred;
++
+ 	struct usb_endpoint_descriptor *intr_ep;
+ 	struct usb_endpoint_descriptor *bulk_tx_ep;
+ 	struct usb_endpoint_descriptor *bulk_rx_ep;
+@@ -449,6 +452,7 @@ static int btusb_recv_intr(struct btusb_data *data, void *buffer, int count)
+ {
+ 	struct sk_buff *skb;
+ 	int err = 0;
++	int event = HCI_OP_NOP;
+
+ 	spin_lock(&data->rxlock);
+ 	skb = data->evt_skb;
+@@ -488,6 +492,9 @@ static int btusb_recv_intr(struct btusb_data *data, void *buffer, int count)
+ 		}
+
+ 		if (!hci_skb_expect(skb)) {
++			struct hci_event_hdr *hdr = (struct hci_event_hdr *)skb->data;
++			event = hdr->evt;
++
+ 			/* Complete frame */
+ 			data->recv_event(data->hdev, skb);
+ 			skb = NULL;
+@@ -495,6 +502,39 @@ static int btusb_recv_intr(struct btusb_data *data, void *buffer, int count)
+ 	}
+
+ 	data->evt_skb = skb;
++
++	/*
++	 * Workaround for a race condition observed with Android phones. After link
++	 * key reply it is expected that HCI_EV_ENCRYPT_CHANGE is received before
++	 * any ACL connection request or it will be dropped by bluez L2CAP layer.
++	 *
++	 * The events are received from usb interrupt transfer and ACL packet from
++	 * usb bulk transfer. I guess the bluetooth controller does not handle
++	 * correctly write ordering between those two transfer types.
++	 *
++	 * The workaround will start queueing ACL packets when link key are exchanged
++	 * until the next real event (not an HCI_EV_CMD_COMPLETE) is received, it
++	 * should be HCI_EV_ENCRYPT_CHANGE.
++	 *
++	 * LIMITATIONS:
++	 *
++	 * An unencrypted connection request forwarded by the controller at
++	 * "ACL queueing time" would pass. Bluetooth specification says that ACL
++	 * transfer is paused until encryption is setup so I hope it is safe to queue
++	 * ACL between HCI_EV_LINK_KEY_REQ and HCI_EV_CMD_COMPLETE.
++	 *
++	 * With concurrent connections from multiple bluetooth devices the workaround
++	 * could not work as any event from any device would flush the queue.
++	 */
++	if (event == HCI_EV_LINK_KEY_REQ) {
++		data->acl_deferred = 1;
++	} else if (data->acl_deferred && event != HCI_EV_CMD_COMPLETE) {
++		while ((skb = skb_dequeue(&data->acl_deferred_q)))
++			hci_recv_frame(data->hdev, skb);
++		skb = NULL;
++		data->acl_deferred = 0;
++	}
++
+ 	spin_unlock(&data->rxlock);
+
+ 	return err;
+@@ -546,7 +586,10 @@ static int btusb_recv_bulk(struct btusb_data *data, void *buffer, int count)
+
+ 		if (!hci_skb_expect(skb)) {
+ 			/* Complete frame */
+-			hci_recv_frame(data->hdev, skb);
++			if (data->acl_deferred)
++				skb_queue_tail(&data->acl_deferred_q, skb);
++			else
++				hci_recv_frame(data->hdev, skb);
+ 			skb = NULL;
+ 		}
+ 	}
+@@ -2815,6 +2858,9 @@ static int btusb_probe(struct usb_interface *intf,
+ 	data->udev = interface_to_usbdev(intf);
+ 	data->intf = intf;
+
++	data->acl_deferred = 0;
++	skb_queue_head_init(&data->acl_deferred_q);
++
+ 	INIT_WORK(&data->work, btusb_work);
+ 	INIT_WORK(&data->waker, btusb_waker);
+ 	init_usb_anchor(&data->deferred);
+@@ -3051,6 +3097,8 @@ static void btusb_disconnect(struct usb_interface *intf)
+ 	if (!data)
+ 		return;
+
++	skb_queue_purge(&data->acl_deferred_q);
++
+ 	hdev = data->hdev;
+ 	usb_set_intfdata(data->intf, NULL);
+
+--
+2.17.1
